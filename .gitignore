@@ -1,0 +1,55 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual Environment
+env/
+venv/
+ENV/
+.env
+.venv
+virtualenv/
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# Flask stuff
+instance/
+.webassets-cache
+
+# Log files
+*.log
+logs/
+
+# Local development settings
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# IDE specific files
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Twilio configuration (if you have any local config files)
+twilio.json
+twilio.cfg
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+
+# Temporary files
+*.bak
+*.tmp
+setup_instructions.md
