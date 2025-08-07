@@ -1,56 +1,39 @@
 from flask import Flask, request, jsonify
 from twilio.twiml.messaging_response import MessagingResponse
-from apscheduler.schedulers.background import BackgroundScheduler
-from twilio.rest import Client
 import logging
 import uuid
 import json
 import os
 from datetime import datetime, timedelta
 
+# Try to import APScheduler, but make it optional
+try:
+    from apscheduler.schedulers.background import BackgroundScheduler
+    scheduler = BackgroundScheduler()
+    scheduler.start()
+    scheduler_available = True
+except ImportError:
+    scheduler_available = False
+    logging.warning("APScheduler not available. Reminder functionality disabled.")
+
+# Try to initialize Twilio client
+try:
+    from twilio.rest import Client
+    # Twilio credentials - replace with your actual credentials
+    TWILIO_ACCOUNT_SID = os.environ.get('TWILIO_ACCOUNT_SID', 'your_account_sid')
+    TWILIO_AUTH_TOKEN = os.environ.get('TWILIO_AUTH_TOKEN', 'your_auth_token')
+    TWILIO_PHONE_NUMBER = os.environ.get('TWILIO_PHONE_NUMBER', 'whatsapp:+14155238886')
+    twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+    twilio_available = True
+except Exception as e:
+    twilio_available = False
+    logging.warning(f"Twilio client initialization failed: {str(e)}. Outgoing messages disabled.")
+
 app = Flask(__name__)
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-# Twilio credentials - replace with your actual credentials
-TWILIO_ACCOUNT_SID = os.environ.get('TWILIO_ACCOUNT_SID', 'your_account_sid')
-TWILIO_AUTH_TOKEN = os.environ.get('TWILIO_AUTH_TOKEN', 'your_auth_token')
-TWILIO_PHONE_NUMBER = os.environ.get('TWILIO_PHONE_NUMBER', 'whatsapp:+14155238886')  # Default Twilio sandbox number
-
-# Initialize Twilio client
-twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-
-# Set up scheduler for reminders
-scheduler = BackgroundScheduler()
-scheduler.start()
-
-# Data storage functions
-def save_data():
-    """Save the work opportunities data to a JSON file"""
-    data = {
-        'work_opportunities': work_opportunities,
-        'current_work_id': current_work_id
-    }
-    with open('catering_data.json', 'w') as f:
-        json.dump(data, f)
-    logger.info("Data saved to file.")
-
-def load_data():
-    """Load the work opportunities data from a JSON file"""
-    global work_opportunities, current_work_id
-    try:
-        if os.path.exists('catering_data.json'):
-            with open('catering_data.json', 'r') as f:
-                data = json.load(f)
-                work_opportunities = data.get('work_opportunities', {})
-                current_work_id = data.get('current_work_id')
-            logger.info("Data loaded from file.")
-        else:
-            logger.info("No data file found. Starting with empty data.")
-    except Exception as e:
-        logger.error(f"Error loading data: {str(e)}")
 
 # Global variables
 admin_number = "whatsapp:+919353692621"  # WhatsApp format with 'whatsapp:' prefix
@@ -61,11 +44,45 @@ current_work_id = None  # The active work ID that workers are responding to
 admin_state = {}  # Store admin state for multi-step operations
 
 # Load data on startup
+def load_data():
+    """Load work opportunities and current work ID from a file if it exists."""
+    global work_opportunities, current_work_id
+    filename = 'catering_data.json'
+    if os.path.exists(filename):
+        try:
+            with open(filename, 'r') as f:
+                data = json.load(f)
+                work_opportunities = data.get('work_opportunities', {})
+                current_work_id = data.get('current_work_id', None)
+            logger.info("Data loaded from file.")
+        except Exception as e:
+            logger.error(f"Error loading data: {str(e)}")
+    else:
+        logger.info("No data file found. Starting fresh.")
+
+def save_data():
+    """Save work opportunities and current work ID to a file."""
+    filename = 'catering_data.json'
+    try:
+        data = {
+            'work_opportunities': work_opportunities,
+            'current_work_id': current_work_id
+        }
+        with open(filename, 'w') as f:
+            json.dump(data, f)
+        logger.info("Data saved to file.")
+    except Exception as e:
+        logger.error(f"Error saving data: {str(e)}")
+
 load_data()
 
 # Function to send reminders
 def send_reminder(work_id, message):
     """Send a reminder to all workers for a specific work opportunity"""
+    if not scheduler_available or not twilio_available:
+        logger.error("Cannot send reminder - scheduler or Twilio client not available")
+        return
+    
     if work_id in work_opportunities:
         work = work_opportunities[work_id]
         workers = work["selected_workers"]
@@ -333,6 +350,10 @@ def whatsapp():
         
         # REMIND command - Start interactive reminder creation
         elif incoming_msg.lower() == "remind":
+            if not scheduler_available:
+                resp.message("Reminder functionality is not available on this server.")
+                return str(resp)
+                
             if not current_work_id or current_work_id not in work_opportunities:
                 resp.message("No active work selected. Use SELECT command to choose a work ID first.")
             else:
@@ -348,6 +369,10 @@ def whatsapp():
         
         # REMIND with arguments: REMIND work_id, message, hours
         elif incoming_msg.lower().startswith("remind "):
+            if not scheduler_available:
+                resp.message("Reminder functionality is not available on this server.")
+                return str(resp)
+                
             try:
                 # Remove the "REMIND " prefix
                 reminder_details = incoming_msg[7:].split(",")
@@ -410,8 +435,12 @@ def whatsapp():
             help_text += "STATUS - Check current workers for active work\n\n"
             help_text += "DELETE work_id - Remove a work opportunity\n\n"
             help_text += "CANCEL - Cancel current operation\n\n"
-            help_text += "REMIND - Start setting a reminder for workers\n\n"
-            help_text += "REMIND work_id, message, hours - Set a reminder in one step\n\n"
+            
+            # Only show reminder commands if scheduler is available
+            if scheduler_available:
+                help_text += "REMIND - Start setting a reminder for workers\n\n"
+                help_text += "REMIND work_id, message, hours - Set a reminder in one step\n\n"
+            
             help_text += "HELP - Show this help message"
             resp.message(help_text)
         
@@ -510,4 +539,5 @@ def index():
     return "WhatsApp Catering Bot is running!"
 
 if __name__ == '__main__':
+    app.run(debug=True)
     app.run(debug=True)
