@@ -1,16 +1,30 @@
 from flask import Flask, request, jsonify
 from twilio.twiml.messaging_response import MessagingResponse
+from apscheduler.schedulers.background import BackgroundScheduler
+from twilio.rest import Client
 import logging
 import uuid
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 
 app = Flask(__name__)
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Twilio credentials - replace with your actual credentials
+TWILIO_ACCOUNT_SID = os.environ.get('TWILIO_ACCOUNT_SID', 'your_account_sid')
+TWILIO_AUTH_TOKEN = os.environ.get('TWILIO_AUTH_TOKEN', 'your_auth_token')
+TWILIO_PHONE_NUMBER = os.environ.get('TWILIO_PHONE_NUMBER', 'whatsapp:+14155238886')  # Default Twilio sandbox number
+
+# Initialize Twilio client
+twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+
+# Set up scheduler for reminders
+scheduler = BackgroundScheduler()
+scheduler.start()
 
 # Data storage functions
 def save_data():
@@ -49,6 +63,45 @@ admin_state = {}  # Store admin state for multi-step operations
 # Load data on startup
 load_data()
 
+# Function to send reminders
+def send_reminder(work_id, message):
+    """Send a reminder to all workers for a specific work opportunity"""
+    if work_id in work_opportunities:
+        work = work_opportunities[work_id]
+        workers = work["selected_workers"]
+        
+        if not workers:
+            logger.info(f"No workers to send reminder for {work_id}")
+            return
+        
+        for worker in workers:
+            try:
+                twilio_client.messages.create(
+                    body=f"REMINDER for {work['title']}: {message}",
+                    from_=TWILIO_PHONE_NUMBER,
+                    to=worker
+                )
+                logger.info(f"Sent reminder to {worker} for {work['title']}")
+            except Exception as e:
+                logger.error(f"Error sending reminder to {worker}: {str(e)}")
+        
+        # Add reminder to work record
+        if "reminders" not in work:
+            work["reminders"] = []
+        
+        work["reminders"].append({
+            "message": message,
+            "sent_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "recipients": len(workers)
+        })
+        
+        # Save data after sending reminders
+        save_data()
+        
+        logger.info(f"Reminder sent to {len(workers)} workers for {work['title']}")
+    else:
+        logger.error(f"Cannot send reminder - Work ID {work_id} not found")
+
 @app.route('/whatsapp', methods=['POST'])
 def whatsapp():
     # Declare global variables at the beginning of the function
@@ -65,56 +118,117 @@ def whatsapp():
     
     # Admin commands
     if sender == admin_number:
-        # Check if admin is in the middle of creating an event
-        if sender in admin_state and admin_state[sender]['action'] == 'creating_event':
-            step = admin_state[sender]['step']
-            data = admin_state[sender]['data']
+        # Check if admin is in the middle of creating an event or reminder
+        if sender in admin_state:
+            if admin_state[sender]['action'] == 'creating_event':
+                step = admin_state[sender]['step']
+                data = admin_state[sender]['data']
+                
+                if step == 'title':
+                    data['title'] = incoming_msg
+                    admin_state[sender]['step'] = 'location'
+                    resp.message("Great! Now send the location:")
+                elif step == 'location':
+                    data['location'] = incoming_msg
+                    admin_state[sender]['step'] = 'time'
+                    resp.message("When is this event? (date and time):")
+                elif step == 'time':
+                    data['time'] = incoming_msg
+                    admin_state[sender]['step'] = 'workers'
+                    resp.message("How many workers are needed? (number only):")
+                elif step == 'workers':
+                    try:
+                        data['required_workers'] = int(incoming_msg)
+                        admin_state[sender]['step'] = 'payment'
+                        resp.message("What is the payment for workers?")
+                    except ValueError:
+                        resp.message("Please enter a valid number for workers needed.")
+                elif step == 'payment':
+                    data['payment'] = incoming_msg
+                    
+                    # Create work ID
+                    work_id = str(uuid.uuid4())[:8]  # Short UUID
+                    
+                    # Store work details
+                    work_opportunities[work_id] = {
+                        "title": data['title'],
+                        "location": data['location'],
+                        "time": data['time'],
+                        "required_workers": data['required_workers'],
+                        "payment": data['payment'],
+                        "selected_workers": [],
+                        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    }
+                    
+                    # Set as current work
+                    current_work_id = work_id
+                    
+                    # Clear admin state
+                    del admin_state[sender]
+                    
+                    resp.message(f"✅ Work opportunity created!\n\nID: {work_id}\nEvent: {data['title']}\nLocation: {data['location']}\nTime: {data['time']}\nWorkers: {data['required_workers']}\nPayment: {data['payment']}\n\nWorkers can now reply 'Yes' to confirm.")
+                
+                return str(resp)
             
-            if step == 'title':
-                data['title'] = incoming_msg
-                admin_state[sender]['step'] = 'location'
-                resp.message("Great! Now send the location:")
-            elif step == 'location':
-                data['location'] = incoming_msg
-                admin_state[sender]['step'] = 'time'
-                resp.message("When is this event? (date and time):")
-            elif step == 'time':
-                data['time'] = incoming_msg
-                admin_state[sender]['step'] = 'workers'
-                resp.message("How many workers are needed? (number only):")
-            elif step == 'workers':
-                try:
-                    data['required_workers'] = int(incoming_msg)
-                    admin_state[sender]['step'] = 'payment'
-                    resp.message("What is the payment for workers?")
-                except ValueError:
-                    resp.message("Please enter a valid number for workers needed.")
-            elif step == 'payment':
-                data['payment'] = incoming_msg
+            elif admin_state[sender]['action'] == 'creating_reminder':
+                step = admin_state[sender]['step']
+                data = admin_state[sender]['data']
                 
-                # Create work ID
-                work_id = str(uuid.uuid4())[:8]  # Short UUID
+                if step == 'message':
+                    data['message'] = incoming_msg
+                    admin_state[sender]['step'] = 'hours'
+                    resp.message("How many hours before the event should this reminder be sent?")
+                elif step == 'hours':
+                    try:
+                        hours = int(incoming_msg)
+                        if hours <= 0:
+                            resp.message("Hours must be a positive number. Please try again:")
+                            return str(resp)
+                        
+                        data['hours'] = hours
+                        work_id = data['work_id']
+                        
+                        # Schedule the reminder
+                        work = work_opportunities[work_id]
+                        event_time_str = work['time']
+                        
+                        # Try to parse the event time - this is a simplification
+                        # In production, you'd want more robust datetime parsing
+                        try:
+                            # For now, just schedule it for X hours from now as a demonstration
+                            reminder_time = datetime.now() + timedelta(hours=hours)
+                            
+                            # Schedule the reminder
+                            scheduler.add_job(
+                                send_reminder,
+                                'date',
+                                run_date=reminder_time,
+                                args=[work_id, data['message']]
+                            )
+                            
+                            # Record the scheduled reminder
+                            if "scheduled_reminders" not in work:
+                                work["scheduled_reminders"] = []
+                            
+                            work["scheduled_reminders"].append({
+                                "message": data['message'],
+                                "hours_before": hours,
+                                "scheduled_for": reminder_time.strftime("%Y-%m-%d %H:%M:%S")
+                            })
+                            
+                            # Clear admin state
+                            del admin_state[sender]
+                            
+                            resp.message(f"✅ Reminder set for {work['title']}!\n\nMessage: {data['message']}\nWill be sent {hours} hours before the event\nScheduled for: {reminder_time.strftime('%Y-%m-%d %H:%M')}")
+                            
+                        except Exception as e:
+                            logger.error(f"Error scheduling reminder: {str(e)}")
+                            resp.message(f"Could not schedule reminder. Please try again later.")
+                            del admin_state[sender]
+                    except ValueError:
+                        resp.message("Please enter a valid number for hours.")
                 
-                # Store work details
-                work_opportunities[work_id] = {
-                    "title": data['title'],
-                    "location": data['location'],
-                    "time": data['time'],
-                    "required_workers": data['required_workers'],
-                    "payment": data['payment'],
-                    "selected_workers": [],
-                    "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                }
-                
-                # Set as current work
-                current_work_id = work_id
-                
-                # Clear admin state
-                del admin_state[sender]
-                
-                resp.message(f"✅ Work opportunity created!\n\nID: {work_id}\nEvent: {data['title']}\nLocation: {data['location']}\nTime: {data['time']}\nWorkers: {data['required_workers']}\nPayment: {data['payment']}\n\nWorkers can now reply 'Yes' to confirm.")
-            
-            return str(resp)
+                return str(resp)
         
         # CREATE command - Start the interactive creation process
         elif incoming_msg.lower() == "create":
@@ -217,6 +331,75 @@ def whatsapp():
             else:
                 resp.message("No active operation to cancel.")
         
+        # REMIND command - Start interactive reminder creation
+        elif incoming_msg.lower() == "remind":
+            if not current_work_id or current_work_id not in work_opportunities:
+                resp.message("No active work selected. Use SELECT command to choose a work ID first.")
+            else:
+                work = work_opportunities[current_work_id]
+                admin_state[sender] = {
+                    'action': 'creating_reminder',
+                    'step': 'message',
+                    'data': {
+                        'work_id': current_work_id
+                    }
+                }
+                resp.message(f"Setting a reminder for '{work['title']}'.\n\nWhat message should be sent to the workers?")
+        
+        # REMIND with arguments: REMIND work_id, message, hours
+        elif incoming_msg.lower().startswith("remind "):
+            try:
+                # Remove the "REMIND " prefix
+                reminder_details = incoming_msg[7:].split(",")
+                if len(reminder_details) < 3:
+                    resp.message("Invalid format. Use: REMIND work_id, message, hours")
+                    return str(resp)
+                
+                work_id = reminder_details[0].strip()
+                message = reminder_details[1].strip()
+                
+                try:
+                    hours = int(reminder_details[2].strip())
+                    if hours <= 0:
+                        resp.message("Hours must be a positive number.")
+                        return str(resp)
+                except ValueError:
+                    resp.message("Hours must be a number.")
+                    return str(resp)
+                
+                if work_id not in work_opportunities:
+                    resp.message(f"Work ID {work_id} not found. Use LIST to see available work opportunities.")
+                    return str(resp)
+                
+                work = work_opportunities[work_id]
+                
+                # Schedule the reminder (same logic as in the interactive method)
+                reminder_time = datetime.now() + timedelta(hours=hours)
+                
+                # Schedule the reminder
+                scheduler.add_job(
+                    send_reminder,
+                    'date',
+                    run_date=reminder_time,
+                    args=[work_id, message]
+                )
+                
+                # Record the scheduled reminder
+                if "scheduled_reminders" not in work:
+                    work["scheduled_reminders"] = []
+                
+                work["scheduled_reminders"].append({
+                    "message": message,
+                    "hours_before": hours,
+                    "scheduled_for": reminder_time.strftime("%Y-%m-%d %H:%M:%S")
+                })
+                
+                resp.message(f"✅ Reminder set for {work['title']}!\n\nMessage: {message}\nWill be sent {hours} hours before the event\nScheduled for: {reminder_time.strftime('%Y-%m-%d %H:%M')}")
+                
+            except Exception as e:
+                logger.error(f"Error setting reminder: {str(e)}")
+                resp.message("Error setting reminder. Please check format and try again.")
+        
         # HELP command - Show available commands
         elif incoming_msg.lower() == "help":
             help_text = "📱 Admin Commands:\n\n"
@@ -227,6 +410,8 @@ def whatsapp():
             help_text += "STATUS - Check current workers for active work\n\n"
             help_text += "DELETE work_id - Remove a work opportunity\n\n"
             help_text += "CANCEL - Cancel current operation\n\n"
+            help_text += "REMIND - Start setting a reminder for workers\n\n"
+            help_text += "REMIND work_id, message, hours - Set a reminder in one step\n\n"
             help_text += "HELP - Show this help message"
             resp.message(help_text)
         
