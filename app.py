@@ -539,5 +539,11 @@ def index():
     return "WhatsApp Catering Bot is running!"
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    # Add more detailed startup logging
+    logger.info("Starting WhatsApp Catering Bot...")
+    logger.info(f"Admin number set to: {admin_number}")
+    logger.info(f"Scheduler available: {scheduler_available}")
+    logger.info(f"Twilio client available: {twilio_available}")
+    
+    # Only one app.run call is needed
     app.run(debug=True)
